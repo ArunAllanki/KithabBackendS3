@@ -10,8 +10,8 @@ import authRoutes from "./Routes/auth.js";
 import metaRoutes from "./Routes/meta.js";
 import adminRoutes from "./Routes/admin.js";
 
-const app = express();
 
+const app = express();
 
 // ===== Middleware =====
 app.use(express.json());
@@ -40,6 +40,7 @@ app.use("/api/notes", notesRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/meta", metaRoutes);
 app.use("/api/admin", adminRoutes);
+
 
 // ===== Start Server =====
 const PORT = process.env.PORT || 5000;

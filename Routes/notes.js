@@ -1,92 +1,98 @@
 import express from "express";
-import multer from "multer";
-import mongoose from "mongoose";
-import JSZip from "jszip";
-import { Readable } from "stream";
 import Note from "../Models/Note.js";
 import Faculty from "../Models/Faculty.js";
-import Student from "../Models/Student.js";
-
 import { authMiddleware } from "../middleware/auth.js";
+import { getUploadURLs, getDownloadURL, deleteS3Object } from "../utils/s3.js"; // utility to delete file
+import JSZip from "jszip";
 
 const router = express.Router();
-const storage = multer.memoryStorage();
-const upload = multer({ storage });
 
-//notes
-router.post(
-  "/upload",
-  authMiddleware,
-  (req, res, next) => {
-    upload.array("files")(req, res, (err) => {
-      if (err)
-        return res
-          .status(500)
-          .json({ message: "Upload error", error: err.message });
-      next();
-    });
-  },
-  async (req, res) => {
-    try {
-      if (req.user.role !== "faculty")
-        return res
-          .status(403)
-          .json({ message: "Only faculty can upload notes" });
+// ------------------- 1. Generate presigned URLs -------------------
+router.post("/upload", authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== "faculty")
+      return res.status(403).json({ message: "Only faculty can upload notes" });
 
-      const { regulation, subject, branch, semester } = req.body;
-      if (
-        !regulation ||
-        !subject ||
-        !branch ||
-        !semester ||
-        !req.files ||
-        req.files.length === 0
-      ) {
-        return res
-          .status(400)
-          .json({ message: "All fields and files are required" });
-      }
+    const { filesMeta } = req.body;
+    if (!filesMeta?.length)
+      return res.status(400).json({ message: "No files metadata provided" });
 
-      const savedNotes = [];
-      for (const file of req.files) {
-        const title = file.originalname.replace(/\.[^/.]+$/, "");
+    const filesWithKeys = filesMeta.map((f) => ({
+      fileKey: `uploads/${Date.now()}_${f.originalName}`,
+      originalName: f.originalName,
+      fileType: f.fileType,
+    }));
 
-        const newNote = new Note({
-          title,
-          regulation,
-          subject,
-          branch,
-          semester,
-          file: { data: file.buffer, contentType: file.mimetype },
-          uploadedBy: req.user.id,
-        });
+    const uploadUrls = await getUploadURLs(filesWithKeys);
+    const filesToUpload = filesWithKeys.map((f, i) => ({
+      ...f,
+      uploadUrl: uploadUrls[i],
+    }));
 
-        const savedNote = await newNote.save();
-        await Faculty.findByIdAndUpdate(req.user.id, {
-          $push: { uploadedNotes: savedNote._id },
-        });
-        savedNotes.push({
-          ...savedNote.toObject(),
-          fileUrl: `/notes/${savedNote._id}`,
-        });
-      }
-
-      res
-        .status(201)
-        .json({ message: "Notes uploaded successfully", notes: savedNotes });
-    } catch (error) {
-      console.error(error);
-      res.status(500).json({ message: "Server error", error: error.message });
-    }
+    res
+      .status(200)
+      .json({ message: "Upload URLs generated", files: filesToUpload });
+  } catch (err) {
+    console.error("Upload error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
   }
-);
+});
 
+// ------------------- 2. Save note metadata -------------------
+router.post("/save-notes", authMiddleware, async (req, res) => {
+  try {
+    if (req.user.role !== "faculty")
+      return res.status(403).json({ message: "Only faculty can save notes" });
+
+    const { regulation, subject, branch, semester, uploadedFiles } = req.body;
+    if (!uploadedFiles?.length)
+      return res
+        .status(400)
+        .json({ message: "No successfully uploaded files" });
+
+    const savedNotes = [];
+
+    for (let file of uploadedFiles) {
+      const newNote = new Note({
+        title: file.originalName.replace(/\.[^/.]+$/, ""),
+        regulation,
+        subject,
+        branch,
+        semester,
+        fileKey: file.fileKey,
+        uploadedBy: req.user.id,
+      });
+
+      const savedNote = await newNote.save();
+
+      await Faculty.findByIdAndUpdate(req.user.id, {
+        $push: { uploadedNotes: savedNote._id },
+      });
+
+      savedNotes.push({
+        _id: savedNote._id,
+        title: savedNote.title,
+        semester: savedNote.semester,
+        branch,
+        subject,
+        regulation,
+        fileKey: savedNote.fileKey,
+      });
+    }
+
+    res.status(201).json({ message: "Notes saved successfully", savedNotes });
+  } catch (err) {
+    console.error("Save notes error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
+
+// ------------------- 3. Get faculty's uploaded notes -------------------
 router.get("/my-uploads", authMiddleware, async (req, res) => {
   try {
-    // Fetch faculty and populate uploaded notes
     const faculty = await Faculty.findById(req.user.id).populate({
       path: "uploadedNotes",
-      options: { sort: { createdAt: -1 } },
+      options: { sort: { createdAt: -1 } }, // latest uploads first
       populate: [
         { path: "branch", select: "name" },
         { path: "subject", select: "name code" },
@@ -96,112 +102,84 @@ router.get("/my-uploads", authMiddleware, async (req, res) => {
 
     if (!faculty) return res.status(404).json({ message: "Faculty not found" });
 
-    const notesWithUrl = faculty.uploadedNotes.map((note) => ({
-      _id: note._id,
-      title: note.title,
-      semester: note.semester,
-      branch: note.branch, // name
-      subject: note.subject, // name & code
-      regulation: note.regulation, // name
-    }));
+    const notesWithUrl = await Promise.all(
+      faculty.uploadedNotes.map(async (note) => ({
+        _id: note._id,
+        title: note.title,
+        semester: note.semester,
+        branch: note.branch,
+        subject: note.subject,
+        regulation: note.regulation,
+        fileUrl: note.fileKey ? await getDownloadURL(note.fileKey) : null,
+        fileKey: note.fileKey,
+      }))
+    );
 
     res.json(notesWithUrl);
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Server error" });
+    res.status(500).json({ message: "Server error", error: err.message });
   }
 });
 
-// ------------------- Download Note -------------------
-// router.get("/:id", async (req, res) => {
-//   try {
-//     const note = await Note.findById(req.params.id);
-//     if (!note) return res.status(404).json({ message: "Note not found" });
+// ------------------- 4. Delete note + remove from S3 -------------------
+router.delete("/:id", authMiddleware, async (req, res) => {
+  const noteId = req.params.id;
 
-//     res.set("Content-Type", note.file.contentType);
-//     res.send(note.file.data);
-//   } catch (error) {
-//     console.error(error);
-//     res
-//       .status(500)
-//       .json({ message: "Error fetching note", error: error.message });
-//   }
-// });
-
-//notes by sub
-router.get("/subject/:id", async (req, res) => {
   try {
-    const { id } = req.params;
-
-    if (!mongoose.Types.ObjectId.isValid(id)) {
-      return res.status(400).json({ message: "Invalid subject id" });
-    }
-
-    const notes = await Note.find({ subject: id })
-      .populate("regulation", "name")
-      .populate("branch", "name")
-      .populate("subject", "name code")
-      .populate("uploadedBy", "name email")
-      .select("-file");
-
-    if (!notes.length) {
-      return res
-        .status(404)
-        .json({ message: "No notes found for this subject" });
-    }
-
-    res.json({ notes });
-  } catch (err) {
-    console.error("Error fetching notes by subject:", err);
-    res.status(500).json({ message: "Server error" });
-  }
-});
-
-router.get("/:id", async (req, res) => {
-  try {
-    const note = await Note.findById(req.params.id);
+    const note = await Note.findById(noteId);
     if (!note) return res.status(404).json({ message: "Note not found" });
 
-    res.set("Content-Type", note.file.contentType);
-    res.set("Content-Disposition", `inline; filename="${note.title}"`);
-    res.send(note.file.data);
-  } catch (error) {
-    console.error(error);
-    res
-      .status(500)
-      .json({ message: "Error fetching note", error: error.message });
+    // Delete file from S3 if exists
+    if (note.fileKey) {
+      await deleteS3Object(note.fileKey); // utility function in s3.js
+    }
+
+    // Remove note from faculty uploadedNotes
+    await Faculty.findByIdAndUpdate(note.uploadedBy, {
+      $pull: { uploadedNotes: note._id },
+    });
+
+    // Delete note document
+    await note.deleteOne();
+
+    res.json({ message: "Note deleted successfully" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Delete failed", error: err.message });
   }
 });
 
-//zip download
-router.post("/download-zip", async (req, res) => {
+// ------------------- 5. Download multiple notes as ZIP -------------------
+router.post("/download-zip", authMiddleware, async (req, res) => {
   try {
-    const { noteIds } = req.body; // Array of note IDs
-    if (!noteIds || !noteIds.length) {
+    const { noteIds } = req.body;
+    if (!noteIds?.length)
       return res.status(400).json({ message: "No notes selected" });
-    }
 
     const notes = await Note.find({ _id: { $in: noteIds } });
-
     if (!notes.length)
       return res.status(404).json({ message: "Notes not found" });
 
     const zip = new JSZip();
+    const filesData = await Promise.all(
+      notes.map(async (note) => {
+        if (!note.fileKey) return null;
+        const fileUrl = await getDownloadURL(note.fileKey);
+        const response = await fetch(fileUrl);
+        const buffer = await response.arrayBuffer();
+        return { buffer, name: note.title + ".pdf" };
+      })
+    );
 
-    notes.forEach((note) => {
-      const fileName =
-        note.title + (note.file?.contentType?.includes("pdf") ? ".pdf" : "");
-      zip.file(fileName, note.file.data);
-    });
-
+    filesData.forEach((f) => f && zip.file(f.name, Buffer.from(f.buffer)));
     const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
 
     res.set({
       "Content-Type": "application/zip",
-      "Content-Disposition": `attachment; filename=notes.zip`,
+      "Content-Disposition": "attachment; filename=notes.zip",
       "Content-Length": zipBuffer.length,
     });
-
     res.send(zipBuffer);
   } catch (err) {
     console.error(err);
@@ -209,41 +187,48 @@ router.post("/download-zip", async (req, res) => {
   }
 });
 
-// ------------------- Add/Remove Favorites -------------------
-// router.post("/:noteId/favorite", authMiddleware, async (req, res) => {
-//   try {
-//     const student = await Student.findById(req.user.id);
-//     if (!student) return res.status(404).json({ message: "Student not found" });
+// ------------------- 6. Get notes by subject -------------------
+router.get("/subject/:subjectId", async (req, res) => {
+  const { subjectId } = req.params;
 
-//     if (!student.favoriteNotes.includes(req.params.noteId)) {
-//       student.favoriteNotes.push(req.params.noteId);
-//       await student.save();
-//     }
-//     res.json({
-//       message: "Added to favorites",
-//       favoriteNotes: student.favoriteNotes,
-//     });
-//   } catch (error) {
-//     res.status(500).json({ message: "Server error", error: error.message });
-//   }
-// });
+  try {
+    // Find notes for the given subject
+    const notes = await Note.find({ subject: subjectId })
+      .populate("branch", "name")
+      .populate("subject", "name code")
+      .populate("regulation", "name")
+      .populate("uploadedBy", "name email") // populate uploader info
+      .sort({ createdAt: -1 }); // latest first
 
-// router.delete("/:noteId/favorite", authMiddleware, async (req, res) => {
-//   try {
-//     const student = await Student.findById(req.user.id);
-//     if (!student) return res.status(404).json({ message: "Student not found" });
+    if (!notes.length) {
+      return res
+        .status(404)
+        .json({ message: "No notes found for this subject" });
+    }
 
-//     student.favoriteNotes = student.favoriteNotes.filter(
-//       (id) => id.toString() !== req.params.noteId
-//     );
-//     await student.save();
-//     res.json({
-//       message: "Removed from favorites",
-//       favoriteNotes: student.favoriteNotes,
-//     });
-//   } catch (error) {
-//     res.status(500).json({ message: "Server error", error: error.message });
-//   }
-// });
+    // Map notes to include download URLs
+    const notesWithUrl = await Promise.all(
+      notes.map(async (note) => ({
+        _id: note._id,
+        title: note.title,
+        semester: note.semester,
+        branch: note.branch,
+        subject: note.subject,
+        regulation: note.regulation,
+        uploadedBy: note.uploadedBy
+          ? { _id: note.uploadedBy._id, name: note.uploadedBy.name }
+          : null,
+        createdAt: note.createdAt,
+        fileUrl: note.fileKey ? await getDownloadURL(note.fileKey) : null,
+        fileKey: note.fileKey,
+      }))
+    );
+
+    res.status(200).json({ notes: notesWithUrl });
+  } catch (err) {
+    console.error("Fetch notes error:", err);
+    res.status(500).json({ message: "Server error", error: err.message });
+  }
+});
 
 export default router;

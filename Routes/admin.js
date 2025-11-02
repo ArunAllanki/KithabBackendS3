@@ -8,6 +8,7 @@ import Faculty from "../Models/Faculty.js";
 import Student from "../Models/Student.js";
 import Note from "../Models/Note.js";
 
+import { getDownloadURL, deleteFile } from "../utils/s3.js"; // import S3 helper
 import { authMiddleware } from "../middleware/auth.js";
 
 const router = express.Router();
@@ -476,15 +477,14 @@ router.get(
   async (req, res) => {
     try {
       const note = await Note.findById(req.params.id);
-      if (!note || !note.file || !note.file.data)
+      if (!note || !note.fileKey)
         return res.status(404).json({ message: "File not found" });
 
-      res.set({
-        "Content-Type": note.file.contentType,
-        "Content-Disposition": `attachment; filename="${note.file.filename}"`,
-      });
+      // Get S3 signed URL
+      const fileUrl = await getDownloadURL(note.fileKey);
 
-      res.send(note.file.data);
+      // Redirect to signed URL (for download/view)
+      res.redirect(fileUrl);
     } catch (err) {
       console.error(err);
       res.status(500).json({ message: "Server error" });
@@ -498,12 +498,14 @@ router.delete(
   adminMiddleware,
   async (req, res) => {
     try {
-      const { id } = req.params;
-      if (!mongoose.Types.ObjectId.isValid(id))
-        return res.status(400).json({ message: "Invalid ID" });
+      const note = await Note.findById(req.params.id);
+      if (!note) return res.status(404).json({ message: "Note not found" });
 
-      const deleted = await Note.findByIdAndDelete(id);
-      if (!deleted) return res.status(404).json({ message: "Note not found" });
+      // Delete from S3
+      await deleteFile(note.fileKey);
+
+      // Delete from Mongo
+      await Note.findByIdAndDelete(req.params.id);
 
       res.json({ message: "Note deleted" });
     } catch (err) {

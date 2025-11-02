@@ -18,11 +18,8 @@ const noteSchema = new mongoose.Schema({
     required: true,
   },
   semester: { type: String, required: true },
-  file: {
-    data: Buffer,
-    contentType: String,
-    filename: String,
-  },
+  // Remove old file buffer storage
+  fileKey: { type: String, required: true }, // S3 object key
   uploadedBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Faculty",
