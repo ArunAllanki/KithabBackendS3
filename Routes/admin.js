@@ -1,3 +1,4 @@
+// routes/admin.js
 import express from "express";
 import mongoose from "mongoose";
 
@@ -5,15 +6,14 @@ import Regulation from "../Models/Regulation.js";
 import Branch from "../Models/Branch.js";
 import Subject from "../Models/Subject.js";
 import Faculty from "../Models/Faculty.js";
-import Student from "../Models/Student.js";
 import Note from "../Models/Note.js";
 
-import { getDownloadURL, deleteFile } from "../utils/s3.js"; // import S3 helper
+import { getDownloadURL, deleteFile } from "../utils/s3.js"; // S3 helpers
 import { authMiddleware } from "../middleware/auth.js";
 
 const router = express.Router();
 
-//admin middleware
+// Admin middleware
 export const adminMiddleware = (req, res, next) => {
   if (!req.user || req.user.role !== "admin") {
     return res.status(403).json({ message: "Admin access required" });
@@ -21,7 +21,7 @@ export const adminMiddleware = (req, res, next) => {
   next();
 };
 
-//regs CRUD
+/* ------------------- REGULATION ROUTES ------------------- */
 router.get(
   "/regulations",
   authMiddleware,
@@ -87,10 +87,8 @@ router.delete(
   async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
-
     try {
       const { id } = req.params;
-
       if (!mongoose.Types.ObjectId.isValid(id))
         return res.status(400).json({ message: "Invalid ID" });
 
@@ -98,18 +96,37 @@ router.delete(
       if (!regulation)
         return res.status(404).json({ message: "Regulation not found" });
 
+      const notes = await Note.find({ regulation: id }).session(session);
+      for (const note of notes) await deleteFile(note.fileKey);
       await Note.deleteMany({ regulation: id }).session(session);
 
       const branches = await Branch.find({ regulation: id }).session(session);
-
       for (const branch of branches) {
+        const branchNotes = await Note.find({ branch: branch._id }).session(
+          session
+        );
+        for (const note of branchNotes) await deleteFile(note.fileKey);
+        await Note.deleteMany({ branch: branch._id }).session(session);
+
+        const subjects = await Subject.find({ branch: branch._id }).session(
+          session
+        );
+        for (const subject of subjects) {
+          const subjectNotes = await Note.find({
+            subject: subject._id,
+          }).session(session);
+          for (const note of subjectNotes) await deleteFile(note.fileKey);
+          await Note.deleteMany({ subject: subject._id }).session(session);
+        }
+
         await Subject.deleteMany({ branch: branch._id }).session(session);
       }
+
       await Branch.deleteMany({ regulation: id }).session(session);
       await Regulation.findByIdAndDelete(id).session(session);
+
       await session.commitTransaction();
       session.endSession();
-
       res.json({
         message:
           "Regulation and all related branches, subjects, and notes deleted successfully.",
@@ -117,14 +134,13 @@ router.delete(
     } catch (err) {
       await session.abortTransaction();
       session.endSession();
-
       console.error("Transaction failed:", err);
       res.status(500).json({ message: "Error during cascade delete" });
     }
   }
 );
 
-//branch CRUD
+/* ------------------- BRANCH ROUTES ------------------- */
 router.get("/branches", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const branches = await Branch.find().populate("regulation", "name");
@@ -178,17 +194,18 @@ router.delete(
   async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
-
     try {
       const { id } = req.params;
-
       if (!mongoose.Types.ObjectId.isValid(id))
         return res.status(400).json({ message: "Invalid ID" });
 
       const branch = await Branch.findById(id).session(session);
       if (!branch) return res.status(404).json({ message: "Branch not found" });
 
+      const branchNotes = await Note.find({ branch: id }).session(session);
+      for (const note of branchNotes) await deleteFile(note.fileKey);
       await Note.deleteMany({ branch: id }).session(session);
+
       await Subject.deleteMany({ branch: id }).session(session);
       await Branch.findByIdAndDelete(id).session(session);
 
@@ -200,14 +217,13 @@ router.delete(
     } catch (err) {
       await session.abortTransaction();
       session.endSession();
-
       console.error("Branch delete transaction failed:", err);
       res.status(500).json({ message: "Error deleting branch" });
     }
   }
 );
 
-//subs CURD
+/* ------------------- SUBJECT ROUTES ------------------- */
 router.get("/subjects", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const subjects = await Subject.find()
@@ -263,34 +279,34 @@ router.delete(
   async (req, res) => {
     const session = await mongoose.startSession();
     session.startTransaction();
-
     try {
       const { id } = req.params;
-
       if (!mongoose.Types.ObjectId.isValid(id))
         return res.status(400).json({ message: "Invalid ID" });
 
       const subject = await Subject.findById(id).session(session);
       if (!subject)
         return res.status(404).json({ message: "Subject not found" });
+
+      const notes = await Note.find({ subject: id }).session(session);
+      for (const note of notes) await deleteFile(note.fileKey);
       await Note.deleteMany({ subject: id }).session(session);
+
       await Subject.findByIdAndDelete(id).session(session);
+
       await session.commitTransaction();
       session.endSession();
-
       res.json({ message: "Subject and related notes deleted successfully." });
     } catch (err) {
       await session.abortTransaction();
       session.endSession();
-
       console.error("Subject delete transaction failed:", err);
       res.status(500).json({ message: "Error deleting subject" });
     }
   }
 );
 
-//faculty CRUD
-
+/* ------------------- FACULTY ROUTES ------------------- */
 router.get("/faculty", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const faculty = await Faculty.find()
@@ -323,7 +339,6 @@ router.post("/faculty", authMiddleware, adminMiddleware, async (req, res) => {
       employeeId,
       designation,
     });
-
     const saved = await faculty.save();
     const savedWithoutPassword = saved.toObject();
     delete savedWithoutPassword.password;
@@ -346,15 +361,12 @@ router.put(
         return res.status(400).json({ message: "Invalid ID" });
 
       const { name, email, designation, password, employeeId } = req.body;
-
       const faculty = await Faculty.findById(id);
       if (!faculty)
         return res.status(404).json({ message: "Faculty not found" });
+
       if (email && email !== faculty.email) {
-        const emailExists = await Faculty.findOne({
-          email,
-          _id: { $ne: id },
-        });
+        const emailExists = await Faculty.findOne({ email, _id: { $ne: id } });
         if (emailExists)
           return res.status(400).json({ message: "Email already exists" });
         faculty.email = email;
@@ -374,7 +386,6 @@ router.put(
 
       if (name) faculty.name = name;
       if (designation) faculty.designation = designation;
-
       if (password) {
         const bcrypt = await import("bcryptjs");
         faculty.password = await bcrypt.hash(password, 10);
@@ -383,7 +394,6 @@ router.put(
       const updated = await faculty.save();
       const updatedWithoutPassword = updated.toObject();
       delete updatedWithoutPassword.password;
-
       res.json(updatedWithoutPassword);
     } catch (err) {
       console.error(err);
@@ -435,7 +445,6 @@ router.get(
 
       if (!faculty)
         return res.status(404).json({ message: "Faculty not found" });
-
       res.json(faculty.uploadedNotes || []);
     } catch (err) {
       console.error(err);
@@ -444,7 +453,7 @@ router.get(
   }
 );
 
-//notes CRUD
+/* ------------------- NOTES ROUTES ------------------- */
 router.get("/notes", authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { regulation, branch, semester, subject } = req.query;
@@ -454,7 +463,7 @@ router.get("/notes", authMiddleware, adminMiddleware, async (req, res) => {
     if (semester) filter.semester = semester;
     if (subject) filter.subject = subject;
 
-    const notes = await Note.find(filter, "-file")
+    const notes = await Note.find(filter, "-fileKey")
       .populate("regulation", "name")
       .populate("branch", "name")
       .populate("subject", "name code")
@@ -470,27 +479,20 @@ router.get("/notes", authMiddleware, adminMiddleware, async (req, res) => {
   }
 });
 
-router.get(
-  "/notes/:id/file",
-  authMiddleware,
-  adminMiddleware,
-  async (req, res) => {
-    try {
-      const note = await Note.findById(req.params.id);
-      if (!note || !note.fileKey)
-        return res.status(404).json({ message: "File not found" });
+router.get("/notes/:id/file", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const note = await Note.findById(req.params.id);
+    if (!note || !note.fileKey)
+      return res.status(404).json({ message: "File not found" });
 
-      // Get S3 signed URL
-      const fileUrl = await getDownloadURL(note.fileKey);
-
-      // Redirect to signed URL (for download/view)
-      res.redirect(fileUrl);
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ message: "Server error" });
-    }
+    const fileUrl = await getDownloadURL(note.fileKey);
+    res.json({ url: fileUrl }); // <-- return JSON with signed URL
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Server error" });
   }
-);
+});
+
 
 router.delete(
   "/notes/:id",
@@ -501,10 +503,7 @@ router.delete(
       const note = await Note.findById(req.params.id);
       if (!note) return res.status(404).json({ message: "Note not found" });
 
-      // Delete from S3
       await deleteFile(note.fileKey);
-
-      // Delete from Mongo
       await Note.findByIdAndDelete(req.params.id);
 
       res.json({ message: "Note deleted" });
